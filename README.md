@@ -10,12 +10,16 @@ The working repository is moved to https://github.com/WICG/direct-sockets
 
 - [Gloal](#gloal)
 - [What is Multicast?](#what-is-multicast)
+  - [Any-Source Multicast (ASM) vs Source-Specific Multicast (SSM)](#any-source-multicast-asm-vs-source-specific-multicast-ssm)
 - [Similar functionality](#similar-functionality)
 - [Use cases](#use-cases)
 - [Sending datagrams example](#sending-datagrams-example)
-- [Receiving datagrams example](#receiving-datagrams-example)
+- [Receiving datagrams example (Any-Source Multicast)](#receiving-datagrams-example-any-source-multicast)
+- [Receiving datagrams example (Source-Specific Multicast)](#receiving-datagrams-example-source-specific-multicast)
 - [IDL Definitions](#idl-definitions)
   - [UDPSocketOptions](#udpsocketoptions)
+  - [MulticastGroupOptions](#multicastgroupoptions)
+  - [MulticastMembership](#multicastmembership)
   - [MulticastController](#multicastcontroller)
 - [Which network interface will it use?](#which-network-interface-will-it-use)
 - [Security considerations](#security-considerations)
@@ -32,6 +36,20 @@ Multicast sockets are a way of one to many network communication. It is possible
 
 In IPv4, any address between 224.0.0.0 to 239.255.255.255 can be used as a multicast address.
 In IPv6 multicast addresses, the first 8 bits are all ones, i.e. FF00::/8. Further, bit 113-116 represents the scope of the address, which can be either one of the following 4: Global, Site-local, Link-local, Node-local.
+
+### Any-Source Multicast (ASM) vs Source-Specific Multicast (SSM)
+
+There are two models for IP multicast:
+
+**Any-Source Multicast (ASM)** is the traditional multicast model where receivers join a multicast group and receive traffic from any source sending to that group. This is simpler but provides less control over which sources can send to the group.
+
+**Source-Specific Multicast (SSM)** allows receivers to specify not only the multicast group they want to join, but also the specific source address from which they want to receive traffic. This provides:
+- **Better security**: Receivers only accept traffic from explicitly specified sources, reducing the risk of unwanted or malicious traffic.
+- **Simplified routing**: Routers don't need to maintain state for all possible sources, making the routing infrastructure more efficient.
+- **Denial-of-service protection**: Attackers cannot inject traffic into a multicast stream without knowing the expected source address.
+
+In IPv4, the SSM address range is 232.0.0.0/8 (232.0.0.0 to 232.255.255.255).
+In IPv6, the SSM address range is ff3x::/32 (where x is the scope).
 
 Node-Local : Same device
 
@@ -86,7 +104,7 @@ await reader.cancel();
 await socket.close();
 ```
 
-## Receiving datagrams example
+## Receiving datagrams example (Any-Source Multicast)
 
 ```javascript
 // Params that sender and receiver are agreed upon.
@@ -106,12 +124,12 @@ const { readable, multicastController } = await socket.opened;
 
 await multicastController.joinGroup(MULTICAST_GROUP_ADDR);
 
-for (group in multicastController.joinedGroups) {
+for (group of multicastController.joinedGroups) {
    console.log("joined multicast group=" + group);
 }
 
 const reader = readable.getReader()
-readStream(reader, (message) => { 
+readStream(reader, (message) => {
     const messageStr = decoder.decode(message.data);
     console.log('processing response= ' + messageStr);
 });
@@ -128,7 +146,7 @@ await socket.close();
 export async function readStream(
   reader, // :ReadableStreamDefaultReader
   cb, // : (value: Uint8Array) => void
-) { 
+) {
   // Read from the socket until it's closed
   while (reader) {
     // Wait for the next chunk
@@ -140,6 +158,86 @@ export async function readStream(
     }
 
     // Release the reader if we're done
+    if (done) {
+      console.log('readStream finish');
+      reader.releaseLock();
+      break;
+    }
+  }
+}
+
+function delay(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+```
+
+## Receiving datagrams example (Source-Specific Multicast)
+
+Source-Specific Multicast (SSM) allows you to receive multicast traffic only from a specific source address. This is useful when you want to ensure that traffic comes from a trusted sender.
+
+```javascript
+// Params that sender and receiver are agreed upon.
+var PORT = 12345;
+// SSM addresses are in the 232.0.0.0/8 range for IPv4
+var MULTICAST_GROUP_ADDR = "232.1.1.1";
+// The specific source we want to receive from
+var SOURCE_ADDR = "192.0.2.100";
+
+// This must be bound socket. Cannot be connected.
+const socket = new UDPSocket({
+    localAddress: '0.0.0.0',
+    localPort: PORT,
+    multicastAllowAddressSharing: true
+});
+
+const { readable, multicastController } = await socket.opened;
+
+// Join the multicast group with a specific source address (SSM)
+await multicastController.joinGroup(MULTICAST_GROUP_ADDR, {
+    sourceAddress: SOURCE_ADDR
+});
+
+// joinedGroups now returns MulticastMembership objects for SSM memberships
+for (const membership of multicastController.joinedGroups) {
+    if (typeof membership === 'string') {
+        // ASM membership (group address only)
+        console.log("joined ASM group=" + membership);
+    } else {
+        // SSM membership (MulticastMembership object)
+        console.log("joined SSM group=" + membership.groupAddress +
+                    " from source=" + membership.sourceAddress);
+    }
+}
+
+const reader = readable.getReader();
+const decoder = new TextDecoder();
+
+readStream(reader, (message) => {
+    const messageStr = decoder.decode(message.data);
+    console.log('processing response from ' + SOURCE_ADDR + ': ' + messageStr);
+});
+
+// stop execution after reading messages for 5s.
+await delay(5000);
+
+await reader.cancel();
+// Leave the SSM group - must specify the same source address
+await multicastController.leaveGroup(MULTICAST_GROUP_ADDR, {
+    sourceAddress: SOURCE_ADDR
+});
+await socket.close();
+
+
+export async function readStream(
+  reader, // :ReadableStreamDefaultReader
+  cb, // : (value: Uint8Array) => void
+) {
+  // Read from the socket until it's closed
+  while (reader) {
+    const { value, done } = await reader.read();
+    if (value) {
+      cb(value);
+    }
     if (done) {
       console.log('readStream finish');
       reader.releaseLock();
@@ -181,6 +279,28 @@ Note: the behavior of loopback is slightly different between Windows and Unix-li
 It corresponds to IP_MULTICAST_LOOP / IPV6_MULTICAST_LOOP in Unix.
 
 
+### MulticastGroupOptions
+
+```java
+dictionary MulticastGroupOptions {
+  DOMString sourceAddress;
+};
+```
+
+* **sourceAddress** (optional) - The IP address of the source for Source-Specific Multicast (SSM). When provided, the socket will only receive multicast packets from this specific source. The source address must be a valid unicast IP address and must match the IP version (IPv4 or IPv6) of the group address.
+
+### MulticastMembership
+
+```java
+dictionary MulticastMembership {
+  required DOMString groupAddress;
+  DOMString sourceAddress;
+};
+```
+
+* **groupAddress** - The multicast group IP address (IPv4: 224.0.0.0/4 or IPv6: ff00::/8).
+* **sourceAddress** (optional) - The source IP address for SSM memberships. Present only for Source-Specific Multicast memberships.
+
 ### MulticastController
 
 ```java
@@ -202,32 +322,37 @@ dictionary UDPSocketOpenInfo : SocketOpenInfo {
 interface MulticastController {
 
   [CallWith=ScriptState, RaisesException, MeasureAs=MulticastControllerJoinGroupFunction]
-  Promise<undefined> joinGroup(DOMString ipAddress);
+  Promise<undefined> joinGroup(DOMString groupAddress, optional MulticastGroupOptions options = {});
   [CallWith=ScriptState, RaisesException, MeasureAs=MulticastControllerLeaveGroupFunction]
-  Promise<undefined> leaveGroup(DOMString ipAddress);
+  Promise<undefined> leaveGroup(DOMString groupAddress, optional MulticastGroupOptions options = {});
 
   [CallWith=ScriptState, MeasureAs=MulticastControllerJoinedGroups]
-  readonly attribute FrozenArray<DOMString> joinedGroups;
+  readonly attribute FrozenArray<(DOMString or MulticastMembership)> joinedGroups;
 };
 ```
 * **MulticastController** is an object returned if the app has permission to use Multicast subscribing.
 
-* **joinGroup(DOMString ipAddress)**<br>
+* **joinGroup(DOMString groupAddress, optional MulticastGroupOptions options)**<br>
 Joins the multicast group and starts to receive packets from that group. The socket must be bound to a local port before calling this method.<br>
-The ipAddress param must be a valid ip address, not a domain name. Otherwise TypeError is thrown.<br>
+The groupAddress param must be a valid multicast IP address, not a domain name. Otherwise TypeError is thrown.<br>
+If `options.sourceAddress` is provided, this creates a Source-Specific Multicast (SSM) membership. The sourceAddress must be a valid unicast IP address matching the IP version of the groupAddress. Otherwise TypeError is thrown.<br>
+Duplicate memberships (same groupAddress and sourceAddress combination) are not allowed and will result in an error.<br>
 The function returns a promise, which resolves with undefined in case of success. In case of a network error, the promise is rejected with a NetworkError DOMException. The message property may contain an implementation-defined string describing the error condition in more detail.<br>
-Corresponds to IP_ADD_MEMBERSHIP / IP6_ADD_MEMBERSHIP in Unix.
+Corresponds to IP_ADD_MEMBERSHIP / IPV6_ADD_MEMBERSHIP for ASM, or IP_ADD_SOURCE_MEMBERSHIP / MCAST_JOIN_SOURCE_GROUP for SSM in Unix.
 
 
-* **leaveGroup(DOMString ipAddress)**<br>
+* **leaveGroup(DOMString groupAddress, optional MulticastGroupOptions options)**<br>
 Leaves the multicast group previously joined using joinGroup. This is only necessary to call if you plan to keep using the socket afterwards, since clean up of resources will be done automatically by the OS when the socket is closed.
 Leaving the group will prevent the router from sending multicast datagrams to the local host, presuming no other process on the host is still joined to the group.<br>
-The ipAddress param must be a valid ip address, not a domain name. Otherwise TypeError is thrown.<br>
+The groupAddress param must be a valid multicast IP address, not a domain name. Otherwise TypeError is thrown.<br>
+For SSM memberships, you must provide the same `options.sourceAddress` that was used when joining. Otherwise the membership will not be found.<br>
 The function returns a promise, which resolves with undefined in case of success. In case of a network error, the promise is rejected with a NetworkError DOMException. The message property may contain an implementation-defined string describing the error condition in more detail.<br>
-Corresponds to IP_DROP_MEMBERSHIP / IP6_DROP_MEMBERSHIP in Unix.
+Corresponds to IP_DROP_MEMBERSHIP / IPV6_DROP_MEMBERSHIP for ASM, or IP_DROP_SOURCE_MEMBERSHIP / MCAST_LEAVE_SOURCE_GROUP for SSM in Unix.
 
-* **FrozenArray<DOMString> joinedGroups**<br>
-Gets the multicast group addresses the socket is currently joined to. The groups that are in process of joining are not returned.
+* **FrozenArray<(DOMString or MulticastMembership)> joinedGroups**<br>
+Gets the multicast group memberships the socket is currently joined to. The groups that are in process of joining are not returned.<br>
+For Any-Source Multicast (ASM) memberships, returns the group address as a DOMString.<br>
+For Source-Specific Multicast (SSM) memberships, returns a MulticastMembership object containing both the groupAddress and sourceAddress.
 
 
 ## Which network interface will it use?
